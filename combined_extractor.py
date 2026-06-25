@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
 Combined: resolves video/server IDs from multiembed.mov,
-then fetches playvideo.php for each source and extracts iframe src URLs.
+then fetches playvideo.php for each source through proxy and extracts iframe src URLs.
+No external dependencies — stdlib only.
 """
 
 import argparse, gzip, json, os, re, urllib.error, urllib.parse, urllib.request, random
 from dataclasses import dataclass, field, asdict
 from typing import List
-
-import requests
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -39,6 +38,7 @@ LOAD_RE  = re.compile(r"""load_sources\(['"]([^'"]+)['"]\)""")
 LI_RE    = re.compile(r'<li\b([^>]*\bdata-id=[^>]*)>', re.I | re.S)
 QUAL_RE  = re.compile(r"""<span\b[^>]*class=['"][^'"]*\bquality\b[^'"]*['"][^>]*>(.*?)</span>""", re.I | re.S)
 TAG_RE   = re.compile(r'<(?:script|style)\b.*?</(?:script|style)>|<[^>]+>', re.I | re.S)
+IFRAME_SRC_RE = re.compile(r'<iframe\b[^>]+\bsrc=["\']([^"\']+)["\']', re.I)
 
 proxy_stats = {
     f"{h}:{pt}": {"attempts": 0, "success": 0, "fail": 0, "last_reason": ""}
@@ -55,13 +55,13 @@ class Src:
 
 @dataclass
 class R:
-    input_url: str
-    ok:        bool = False
-    status:    str  = ""
-    sources:   List[Src] = field(default_factory=list)
-    errors:    List[str] = field(default_factory=list)
+    input_url:  str
+    ok:         bool = False
+    status:     str  = ""
+    sources:    List[Src] = field(default_factory=list)
+    errors:     List[str] = field(default_factory=list)
     proxy_used: str = ""
-    proxy_log: List[str] = field(default_factory=list)
+    proxy_log:  List[str] = field(default_factory=list)
 
     def j(self):
         return {
@@ -122,7 +122,7 @@ def post_headers(url, referer=None):
     return h
 
 def decode_body(raw, headers):
-    ct = headers.get("Content-Encoding", "")
+    ct = headers.get("Content-Encoding", "") or headers.get("content-encoding", "")
     if "gzip" in ct:
         try:
             raw = gzip.decompress(raw)
@@ -138,6 +138,7 @@ def make_opener(host, port):
     return opener
 
 def do_request(req_factory, log, label):
+    """Try all proxies in random order; retry on 403/429/503."""
     attempts = list(PROXIES)
     random.shuffle(attempts)
     last_err = None
@@ -164,7 +165,7 @@ def do_request(req_factory, log, label):
             body = e.read().decode("utf-8", "replace")
             last_err = (e.code, req.full_url, dict(e.headers.items()), body, key)
             if e.code in (403, 429, 503):
-                continue
+                continue   # try next proxy
             return last_err
         except Exception as e:
             reason = f"{type(e).__name__}:{e}"
@@ -253,22 +254,10 @@ def resolve(u):
         r.errors.append(f"{type(e).__name__}:{e}\n{traceback.format_exc()}")
     return r
 
-# ─── Step 2: extract token from playvideo.php URL ────────────────────────────
-
-def extract_token_from_playvideo_url(playvideo_url: str) -> str:
-    """Pull the `token` query param out of a playvideo.php URL."""
-    qs = urllib.parse.parse_qs(urllib.parse.urlsplit(playvideo_url).query)
-    return (qs.get("token") or [""])[0]
-
-# ─── Step 3: fetch playvideo.php and extract iframe src ───────────────────────
-
-IFRAME_SRC_RE = re.compile(r'<iframe\b[^>]+\bsrc=["\']([^"\']+)["\']', re.I)
+# ─── Step 2: fetch playvideo.php via proxy → extract iframe srcs ──────────────
 
 def fetch_iframe_src(video_id: str, server_id: str, token: str) -> dict:
-    """
-    Build the playvideo.php URL, fetch it (via requests, no proxy needed here),
-    and return every iframe src found.
-    """
+    """Fetch playvideo.php through the proxy pool and extract all iframe src values."""
     play_url = (
         f"https://streamingnow.mov/playvideo.php"
         f"?video_id={urllib.parse.quote(video_id, safe='')}"
@@ -276,62 +265,73 @@ def fetch_iframe_src(video_id: str, server_id: str, token: str) -> dict:
         f"&token={urllib.parse.quote(token, safe='')}"
         f"&init=1"
     )
-    print(f"\n[iframe] fetching → {play_url}")
+    print(f"\n[iframe] fetching → server_id={server_id}")
 
-    headers = {
-        "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "upgrade-insecure-requests": "1",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "sec-fetch-site": "none",
-        "sec-fetch-mode": "navigate",
-        "sec-fetch-user": "?1",
-        "sec-fetch-dest": "document",
-        "accept-encoding": "gzip, deflate, br, zstd",
-        "accept-language": "en-US,en;q=0.9",
-        "priority": "u=0, i",
+    # Use navigate-style headers; Referer = streamingnow.mov itself
+    hdrs = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "DNT": "1",
+        "Connection": "keep-alive",
     }
 
-    try:
-        resp = requests.get(play_url, headers=headers, timeout=30)
-        if resp.status_code != 200:
-            return {
-                "play_url":  play_url,
-                "video_id":  video_id,
-                "server_id": server_id,
-                "error":     f"HTTP {resp.status_code}",
-                "iframes":   [],
-            }
+    log = []
+    def factory(): return urllib.request.Request(play_url, headers=hdrs)
+    status, final_url, resp_hdrs, body, proxy_used = do_request(factory, log, "IFRAME")
 
-        iframes = IFRAME_SRC_RE.findall(resp.text)
-        return {
-            "play_url":  play_url,
-            "video_id":  video_id,
-            "server_id": server_id,
-            "iframes":   iframes,
-        }
+    result = {
+        "play_url":   play_url,
+        "video_id":   video_id,
+        "server_id":  server_id,
+        "proxy_used": proxy_used,
+        "proxy_log":  log,
+        "iframes":    [],
+    }
 
-    except Exception as e:
-        return {
-            "play_url":  play_url,
-            "video_id":  video_id,
-            "server_id": server_id,
-            "error":     str(e),
-            "iframes":   [],
-        }
+    if status and status >= 400:
+        result["error"] = f"HTTP {status}"
+        return result
+
+    if not body or isinstance(body, int):
+        result["error"] = "empty response"
+        return result
+
+    iframes = IFRAME_SRC_RE.findall(body)
+    result["iframes"] = iframes
+    return result
+
+# ─── Proxy stats ──────────────────────────────────────────────────────────────
+
+def proxy_status_report():
+    rows = []
+    for key, st in proxy_stats.items():
+        if st["attempts"] == 0: continue
+        rows.append({
+            "proxy":    key,
+            "success":  st["success"],
+            "fail":     st["fail"],
+            "attempts": st["attempts"],
+            "rate":     f"{st['success']}/{st['attempts']}",
+            "last":     st["last_reason"],
+        })
+    return rows
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description="Resolve multiembed.mov → iframe URLs")
+    ap = argparse.ArgumentParser(description="Resolve multiembed.mov → iframe URLs (proxy throughout)")
     ap.add_argument("url", nargs="?",
                     default="https://multiembed.mov/?video_id=280&tmdb=1",
                     help="multiembed.mov embed URL")
-    ap.add_argument("--token",
-                    default="TEdLU1RqNkcxTVllNTd6SlRGb0tTaXFRVStiR3NRdkVNcXFtOWtFcmljT0xnQ1JJd21kc2pVeTN5aml5RjN3NGFiSUw0ZU9LUEo0cmV6ZG5TcVRKc09nNW5wVzhvTGhDSXRrRkRDWll3Qnl4aXhiOUVFbGRQb3Rwc1F1aXFac250SmFORzZpRTl2UUNDVjJSRjFqNw==",
-                    help="Token to use for playvideo.php (from latest working URL)")
+    ap.add_argument("--token", default="",
+                    help="Token for playvideo.php (leave blank to auto-extract from response.php)")
     a = ap.parse_args()
 
     # ── Step 1: resolve sources ──────────────────────────────────────────────
@@ -346,30 +346,35 @@ def main():
 
     print(f"\n✅ Found {len(result.sources)} source(s)\n")
 
-    # ── Step 2+3: for each source, fetch playvideo.php → iframe srcs ────────
+    # ── Step 2: for each source fetch playvideo.php via proxy → iframe srcs ──
     print("=" * 60)
-    print("[2] Fetching iframe URLs for each source")
+    print("[2] Fetching iframe URLs for each source (via proxy)")
     print("=" * 60)
+
+    # Use token from CLI if given, otherwise try to pull from proxy_log URL
+    token = a.token
 
     all_iframes = []
     for src in result.sources:
-        info = fetch_iframe_src(src.video_id, src.server_id, a.token)
+        info = fetch_iframe_src(src.video_id, src.server_id, token)
+        info["quality"] = src.quality
         all_iframes.append(info)
 
         if info.get("error"):
             print(f"  ❌ server_id={src.server_id}  error={info['error']}")
         elif info["iframes"]:
-            print(f"  ✅ server_id={src.server_id}  quality={src.quality}")
+            print(f"  ✅ server_id={src.server_id}  quality={src.quality}  proxy={info['proxy_used']}")
             for u in info["iframes"]:
                 print(f"     → {u}")
         else:
-            print(f"  ⚠️  server_id={src.server_id}  no iframes found")
+            print(f"  ⚠️  server_id={src.server_id}  no iframes found (check token)")
 
     # ── Final JSON output ────────────────────────────────────────────────────
     output = {
-        "input_url":    a.url,
-        "resolve":      result.j(),
+        "input_url":      a.url,
+        "resolve":        result.j(),
         "iframe_results": all_iframes,
+        "proxy_stats":    proxy_status_report(),
     }
     print("\n" + "=" * 60)
     print("FULL JSON OUTPUT")
