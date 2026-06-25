@@ -8,7 +8,7 @@ on:
         required: false
         default: "https://multiembed.mov/?video_id=280&tmdb=1"
       token:
-        description: "Token for playvideo.php (leave blank to skip iframe extraction)"
+        description: "Token for playvideo.php (leave blank = no iframe extraction)"
         required: false
         default: ""
   schedule:
@@ -27,9 +27,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install requests
 
       - name: Verify outbound IP is a proxy (not GitHub datacenter)
         run: |
@@ -97,7 +94,7 @@ jobs:
           import json, sys
           with open("result.json") as f:
               data = json.load(f)
-          resolve = data.get("resolve", data)  # support both old and new format
+          resolve = data.get("resolve", data)
           if not resolve.get("ok"):
               print(f"::error::Resolver failed: {resolve.get('status')} errors={resolve.get('errors')}")
               sys.exit(1)
@@ -105,7 +102,7 @@ jobs:
           print(f"✅ Resolved {len(sources)} sources via proxy {resolve.get('proxy_used')}")
           for r in data.get("iframe_results", []):
               for iframe in r.get("iframes", []):
-                  print(f"  🎬 server_id={r['server_id']} → {iframe}")
+                  print(f"  🎬 server_id={r['server_id']} quality={r.get('quality','')} → {iframe}")
           PYEOF
 
       - name: Upload result artifact
