@@ -2,12 +2,15 @@
 """
 Combined: resolves video/server IDs from multiembed.mov,
 then fetches playvideo.php for each source through proxy and extracts iframe src URLs.
+- Rotates proxy on 403/429/503
+- Retries with different proxy if page loads but has no iframe (empty response / blocked silently)
+- Extracts iframe src from multiple patterns
 No external dependencies — stdlib only.
 """
 
 import argparse, gzip, json, os, re, urllib.error, urllib.parse, urllib.request, random
 from dataclasses import dataclass, field, asdict
-from typing import List
+from typing import List, Optional
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -33,12 +36,21 @@ EMBED_ORIGIN   = "https://multiembed.mov"
 STREAM_ORIGIN  = "https://streamingnow.mov"
 STREAM_REFERER = "https://streamingnow.mov/response.php"
 
-TOKEN_RE = re.compile(r'[?&]play=([^&"\'<>]+)', re.I)
-LOAD_RE  = re.compile(r"""load_sources\(['"]([^'"]+)['"]\)""")
-LI_RE    = re.compile(r'<li\b([^>]*\bdata-id=[^>]*)>', re.I | re.S)
-QUAL_RE  = re.compile(r"""<span\b[^>]*class=['"][^'"]*\bquality\b[^'"]*['"][^>]*>(.*?)</span>""", re.I | re.S)
-TAG_RE   = re.compile(r'<(?:script|style)\b.*?</(?:script|style)>|<[^>]+>', re.I | re.S)
-IFRAME_SRC_RE = re.compile(r'<iframe\b[^>]+\bsrc=["\']([^"\']+)["\']', re.I)
+TOKEN_RE  = re.compile(r'[?&]play=([^&"\'<>]+)', re.I)
+LOAD_RE   = re.compile(r"""load_sources\(['"]([^'"]+)['"]\)""")
+LI_RE     = re.compile(r'<li\b([^>]*\bdata-id=[^>]*)>', re.I | re.S)
+QUAL_RE   = re.compile(r"""<span\b[^>]*class=['"][^'"]*\bquality\b[^'"]*['"][^>]*>(.*?)</span>""", re.I | re.S)
+TAG_RE    = re.compile(r'<(?:script|style)\b.*?</(?:script|style)>|<[^>]+>', re.I | re.S)
+
+# Multiple patterns to catch iframe src in different HTML structures
+IFRAME_PATTERNS = [
+    re.compile(r'<iframe\b[^>]+\bsrc=["\']([^"\']+)["\']', re.I),           # standard
+    re.compile(r'<iframe\b[^>]*\bsrc=([^\s>]+)', re.I),                      # unquoted
+    re.compile(r'src\s*=\s*["\']([^"\']*(?:https?://)[^"\']+)["\']', re.I), # any src= with full URL
+    re.compile(r'window\.location\s*=\s*["\']([^"\']+)["\']', re.I),        # js redirect
+    re.compile(r'window\.location\.href\s*=\s*["\']([^"\']+)["\']', re.I),  # js redirect variant
+    re.compile(r'player\.src\s*\(\s*["\']([^"\']+)["\']', re.I),            # js player
+]
 
 proxy_stats = {
     f"{h}:{pt}": {"attempts": 0, "success": 0, "fail": 0, "last_reason": ""}
@@ -74,7 +86,7 @@ class R:
             "proxy_log":  self.proxy_log,
         }
 
-# ─── Proxy / HTTP helpers ─────────────────────────────────────────────────────
+# ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 def get_origin(url):
     p = urllib.parse.urlsplit(url)
@@ -137,8 +149,12 @@ def make_opener(host, port):
     opener.addheaders = []
     return opener
 
-def do_request(req_factory, log, label):
-    """Try all proxies in random order; retry on 403/429/503."""
+def do_request(req_factory, log, label, skip_on_empty=False):
+    """
+    Try all proxies in random order.
+    - Retries on 403/429/503
+    - If skip_on_empty=True, also retries when body has no useful content
+    """
     attempts = list(PROXIES)
     random.shuffle(attempts)
     last_err = None
@@ -155,7 +171,18 @@ def do_request(req_factory, log, label):
                 proxy_stats[key]["last_reason"] = "ok"
                 msg = f"[{label} OK] proxy={key} url={req.full_url}"
                 log.append(msg); print(msg)
+
+                # If caller wants us to retry on empty/blocked responses, check body
+                if skip_on_empty and _looks_empty(body):
+                    msg = f"[{label} EMPTY] proxy={key} — body has no useful content, rotating proxy"
+                    log.append(msg); print(msg)
+                    proxy_stats[key]["fail"] += 1
+                    proxy_stats[key]["last_reason"] = "empty"
+                    last_err = (200, req.full_url, dict(resp.headers.items()), body, key)
+                    continue
+
                 return resp.status, resp.geturl(), dict(resp.headers.items()), body, key
+
         except urllib.error.HTTPError as e:
             reason = f"HTTP{e.code}"
             proxy_stats[key]["fail"] += 1
@@ -165,7 +192,7 @@ def do_request(req_factory, log, label):
             body = e.read().decode("utf-8", "replace")
             last_err = (e.code, req.full_url, dict(e.headers.items()), body, key)
             if e.code in (403, 429, 503):
-                continue   # try next proxy
+                continue   # rotate to next proxy
             return last_err
         except Exception as e:
             reason = f"{type(e).__name__}:{e}"
@@ -176,6 +203,19 @@ def do_request(req_factory, log, label):
             last_err = (0, req.full_url, {}, reason, key)
             continue
     return last_err or (0, "", {}, "all proxies failed", "none")
+
+def _looks_empty(body: str) -> bool:
+    """Return True if the page body looks like a blocked/empty response."""
+    if not body or len(body.strip()) < 50:
+        return True
+    lower = body.lower()
+    # Blocked / error pages with no real content
+    if "<iframe" in lower or "src=" in lower:
+        return False
+    if any(k in lower for k in ("error", "forbidden", "access denied", "not found")):
+        if "<iframe" not in lower:
+            return True
+    return False
 
 def g(u, referer=None, log=None):
     if log is None: log = []
@@ -191,7 +231,7 @@ def p(u, d, referer=None, log=None):
     )
     return do_request(factory, log, "POST")
 
-# ─── Token / source extraction ────────────────────────────────────────────────
+# ─── Source extraction ────────────────────────────────────────────────────────
 
 def tok(s):
     m = TOKEN_RE.search(s)
@@ -216,7 +256,20 @@ def extract_sources(html_body):
         sources.append(Src(vi.group(1), si.group(1), q))
     return sources
 
-# ─── Step 1: resolve embed page → sources ─────────────────────────────────────
+def extract_iframes(body: str) -> List[str]:
+    """Try multiple patterns to find any embedded player URL."""
+    seen = set()
+    found = []
+    for pattern in IFRAME_PATTERNS:
+        for m in pattern.finditer(body):
+            url = m.group(1).strip()
+            # Only keep actual URLs, not relative paths or tiny strings
+            if url and len(url) > 10 and url not in seen:
+                seen.add(url)
+                found.append(url)
+    return found
+
+# ─── Step 1: resolve embed → sources ─────────────────────────────────────────
 
 def resolve(u):
     r = R(u)
@@ -254,10 +307,9 @@ def resolve(u):
         r.errors.append(f"{type(e).__name__}:{e}\n{traceback.format_exc()}")
     return r
 
-# ─── Step 2: fetch playvideo.php via proxy → extract iframe srcs ──────────────
+# ─── Step 2: playvideo.php → iframe src (with proxy rotation + empty retry) ──
 
 def fetch_iframe_src(video_id: str, server_id: str, token: str) -> dict:
-    """Fetch playvideo.php through the proxy pool and extract all iframe src values."""
     play_url = (
         f"https://streamingnow.mov/playvideo.php"
         f"?video_id={urllib.parse.quote(video_id, safe='')}"
@@ -267,7 +319,6 @@ def fetch_iframe_src(video_id: str, server_id: str, token: str) -> dict:
     )
     print(f"\n[iframe] fetching → server_id={server_id}")
 
-    # Use navigate-style headers; Referer = streamingnow.mov itself
     hdrs = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -284,7 +335,11 @@ def fetch_iframe_src(video_id: str, server_id: str, token: str) -> dict:
 
     log = []
     def factory(): return urllib.request.Request(play_url, headers=hdrs)
-    status, final_url, resp_hdrs, body, proxy_used = do_request(factory, log, "IFRAME")
+
+    # skip_on_empty=True → rotate proxy if page loads but contains no iframe
+    status, final_url, resp_hdrs, body, proxy_used = do_request(
+        factory, log, "IFRAME", skip_on_empty=True
+    )
 
     result = {
         "play_url":   play_url,
@@ -297,14 +352,23 @@ def fetch_iframe_src(video_id: str, server_id: str, token: str) -> dict:
 
     if status and status >= 400:
         result["error"] = f"HTTP {status}"
+        # Print debug snippet
+        if isinstance(body, str):
+            print(f"  [debug] HTTP{status} body snippet: {body[:300]}")
         return result
 
-    if not body or isinstance(body, int):
+    if not body or not isinstance(body, str):
         result["error"] = "empty response"
         return result
 
-    iframes = IFRAME_SRC_RE.findall(body)
+    iframes = extract_iframes(body)
     result["iframes"] = iframes
+
+    # Debug: if still empty, print body snippet to help diagnose
+    if not iframes:
+        print(f"  [debug] server_id={server_id} — no iframe found. Body snippet:")
+        print(f"  {body[:500]}")
+
     return result
 
 # ─── Proxy stats ──────────────────────────────────────────────────────────────
@@ -331,7 +395,7 @@ def main():
                     default="https://multiembed.mov/?video_id=280&tmdb=1",
                     help="multiembed.mov embed URL")
     ap.add_argument("--token", default="",
-                    help="Token for playvideo.php (leave blank to auto-extract from response.php)")
+                    help="Token for playvideo.php")
     a = ap.parse_args()
 
     # ── Step 1: resolve sources ──────────────────────────────────────────────
@@ -346,15 +410,14 @@ def main():
 
     print(f"\n✅ Found {len(result.sources)} source(s)\n")
 
-    # ── Step 2: for each source fetch playvideo.php via proxy → iframe srcs ──
+    # ── Step 2: fetch playvideo.php via proxy → iframe srcs ──────────────────
     print("=" * 60)
-    print("[2] Fetching iframe URLs for each source (via proxy)")
+    print("[2] Fetching iframe URLs for each source (via proxy, with rotation)")
     print("=" * 60)
 
-    # Use token from CLI if given, otherwise try to pull from proxy_log URL
     token = a.token
-
     all_iframes = []
+
     for src in result.sources:
         info = fetch_iframe_src(src.video_id, src.server_id, token)
         info["quality"] = src.quality
@@ -367,9 +430,16 @@ def main():
             for u in info["iframes"]:
                 print(f"     → {u}")
         else:
-            print(f"  ⚠️  server_id={src.server_id}  no iframes found (check token)")
+            print(f"  ⚠️  server_id={src.server_id}  no iframe found after all proxies tried")
 
-    # ── Final JSON output ────────────────────────────────────────────────────
+    # ── Summary ───────────────────────────────────────────────────────────────
+    total   = len(all_iframes)
+    success = sum(1 for i in all_iframes if i.get("iframes"))
+    print(f"\n{'='*60}")
+    print(f"SUMMARY: {success}/{total} sources extracted successfully")
+    print(f"{'='*60}")
+
+    # ── Final JSON output ─────────────────────────────────────────────────────
     output = {
         "input_url":      a.url,
         "resolve":        result.j(),
