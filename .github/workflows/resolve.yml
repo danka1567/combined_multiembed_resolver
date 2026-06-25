@@ -7,6 +7,10 @@ on:
         description: "URL to resolve"
         required: false
         default: "https://multiembed.mov/?video_id=280&tmdb=1"
+      token:
+        description: "Token for playvideo.php (leave blank to skip iframe extraction)"
+        required: false
+        default: ""
   schedule:
     - cron: "0 */6 * * *"
 
@@ -23,6 +27,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
 
       - name: Verify outbound IP is a proxy (not GitHub datacenter)
         run: |
@@ -73,11 +80,16 @@ jobs:
           print(f"✅ IP {ip} is clean — proxy is active.")
           PYEOF
 
-      - name: Run resolver through proxy
+      - name: Run combined resolver + iframe extractor
         env:
           RESOLVE_URL: ${{ github.event.inputs.url || 'https://multiembed.mov/?video_id=280&tmdb=1' }}
+          RESOLVE_TOKEN: ${{ github.event.inputs.token || '' }}
         run: |
-          python3 embed_resolver.py "$RESOLVE_URL" | tee result.json
+          if [ -n "$RESOLVE_TOKEN" ]; then
+            python3 combined_extractor.py "$RESOLVE_URL" --token "$RESOLVE_TOKEN" | tee result.json
+          else
+            python3 combined_extractor.py "$RESOLVE_URL" | tee result.json
+          fi
 
       - name: Check result
         run: |
@@ -85,10 +97,15 @@ jobs:
           import json, sys
           with open("result.json") as f:
               data = json.load(f)
-          if not data.get("ok"):
-              print(f"::error::Resolver failed: {data.get('status')} errors={data.get('errors')}")
+          resolve = data.get("resolve", data)  # support both old and new format
+          if not resolve.get("ok"):
+              print(f"::error::Resolver failed: {resolve.get('status')} errors={resolve.get('errors')}")
               sys.exit(1)
-          print(f"✅ Resolved {len(data['sources'])} sources via proxy {data['proxy_used']}")
+          sources = resolve.get("sources", [])
+          print(f"✅ Resolved {len(sources)} sources via proxy {resolve.get('proxy_used')}")
+          for r in data.get("iframe_results", []):
+              for iframe in r.get("iframes", []):
+                  print(f"  🎬 server_id={r['server_id']} → {iframe}")
           PYEOF
 
       - name: Upload result artifact
